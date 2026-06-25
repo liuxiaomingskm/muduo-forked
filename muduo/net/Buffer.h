@@ -107,6 +107,66 @@ class Buffer : public muduo::copyable
     return static_cast<const char*>(eol);
   }
 
+  enum ProtocolHeaderResult
+  {
+    kProtocolHeaderComplete,
+    kProtocolHeaderIncomplete,
+    kProtocolHeaderInvalid
+  };
+
+  ProtocolHeaderResult retrieveProtocolHeader(muduo::string* out)
+  {
+    static const char kPrefix[] = "GET HTTPS://";
+    static const char kTerminator[] = "&/&/";
+    static const char kHost[] = "host";
+    static const char kPath[] = "path";
+    static const char kMethod[] = "method";
+    static const char kScheme[] = "scheme";
+    static const size_t kPrefixLen = sizeof(kPrefix) - 1;
+    static const size_t kTerminatorLen = sizeof(kTerminator) - 1;
+    static const size_t kMinHeaderLen = 128;
+    static const size_t kMaxHeaderLen = 1024;
+
+    const char* const begin = peek();
+    const char* const end = begin + readableBytes();
+    if (static_cast<size_t>(end - begin) < kPrefixLen)
+    {
+      return kProtocolHeaderIncomplete;
+    }
+    if (::memcmp(begin, kPrefix, kPrefixLen) != 0)
+    {
+      return kProtocolHeaderInvalid;
+    }
+
+    const char* term = std::search(begin, end,
+                                   kTerminator, kTerminator + kTerminatorLen);
+    if (term == end)
+    {
+      return kProtocolHeaderIncomplete;
+    }
+
+    const size_t headerLen = (term - begin);
+
+    out->assign(begin, headerLen);
+    retrieve(headerLen);
+
+    if (headerLen <= kMinHeaderLen || headerLen >= kMaxHeaderLen)
+    {
+      return kProtocolHeaderInvalid;
+    }
+
+    const char* hdrEnd = begin + headerLen;
+    if (std::search(begin, hdrEnd, kHost, kHost + sizeof(kHost) - 1) == hdrEnd ||
+        std::search(begin, hdrEnd, kPath, kPath + sizeof(kPath) - 1) == hdrEnd ||
+        std::search(begin, hdrEnd, kMethod, kMethod + sizeof(kMethod) - 1) == hdrEnd ||
+        std::search(begin, hdrEnd, kScheme, kScheme + sizeof(kScheme) - 1) == hdrEnd)
+    {
+      return kProtocolHeaderInvalid;
+    }
+
+    return kProtocolHeaderComplete;
+  }
+
   // retrieve returns void, to prevent
   // string str(retrieve(readableBytes()), readableBytes());
   // the evaluation of two functions are unspecified
