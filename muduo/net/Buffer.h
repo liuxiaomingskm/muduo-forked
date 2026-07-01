@@ -169,6 +169,73 @@ class Buffer : public muduo::copyable
     return result;
   }
 
+  /// Result of retrieveCommandFrame().
+  enum CommandFrameState
+  {
+    kCommandFrameComplete,    ///< a full, valid frame was extracted
+    kCommandFrameIncomplete,  ///< not enough bytes yet; buffer left untouched
+    kCommandFrameInvalid,     ///< a malformed frame; buffer left untouched
+  };
+
+  /// Wire format of a "command frame" (bespoke binary transport):
+  ///   [STX=0x02][cmd:1][payloadLen:2 big-endian][payload...][xorCheck:1]
+  /// where xorCheck == cmd ^ lenHi ^ lenLo ^ payload[0] ^ ... ^ payload[n-1].
+  ///
+  /// Parses a single command frame from the front of the readable region:
+  ///   * returns kCommandFrameIncomplete (leaving the buffer and *out
+  ///     unchanged) if a whole frame has not arrived yet;
+  ///   * returns kCommandFrameInvalid (leaving the buffer and *out unchanged)
+  ///     if the leading byte is not STX, the checksum does not match, or the
+  ///     declared payload length exceeds kMaxFramePayload;
+  ///   * on success sets *cmd and *out to the frame's command byte and payload,
+  ///     consumes exactly the frame's bytes, and returns kCommandFrameComplete.
+  static const uint8_t kFrameStx = 0x02;
+  static const size_t kFrameHeaderLen = 4;    // STX + cmd + payloadLen(2)
+  static const size_t kFrameTrailerLen = 1;   // xorCheck
+  static const size_t kMaxFramePayload = 512;
+
+  CommandFrameState retrieveCommandFrame(uint8_t* cmd, string* out)
+  {
+    if (readableBytes() < kFrameHeaderLen + kFrameTrailerLen)
+    {
+      return kCommandFrameIncomplete;
+    }
+
+    const char* p = peek();
+    if (static_cast<uint8_t>(p[0]) != kFrameStx)
+    {
+      return kCommandFrameInvalid;
+    }
+
+    const uint16_t payloadLen =
+        static_cast<uint16_t>(
+            (static_cast<uint16_t>(static_cast<uint8_t>(p[2])) << 8) |
+            static_cast<uint16_t>(static_cast<uint8_t>(p[3])));
+    const size_t frameLen = kFrameHeaderLen + payloadLen;
+
+    if (readableBytes() < frameLen)
+    {
+      return kCommandFrameIncomplete;
+    }
+
+    *cmd = static_cast<uint8_t>(p[1]);
+    out->assign(p + kFrameHeaderLen, payloadLen);
+    retrieve(frameLen);
+
+    uint8_t chk = static_cast<uint8_t>(p[1]) ^ static_cast<uint8_t>(p[2]) ^
+                  static_cast<uint8_t>(p[3]);
+    for (size_t i = 0; i < payloadLen; ++i)
+    {
+      chk ^= static_cast<uint8_t>(p[kFrameHeaderLen + i]);
+    }
+    if (chk != static_cast<uint8_t>(p[kFrameHeaderLen + payloadLen]))
+    {
+      return kCommandFrameInvalid;
+    }
+
+    return kCommandFrameComplete;
+  }
+
   StringPiece toStringPiece() const
   {
     return StringPiece(peek(), static_cast<int>(readableBytes()));
