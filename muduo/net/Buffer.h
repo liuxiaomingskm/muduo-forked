@@ -169,6 +169,108 @@ class Buffer : public muduo::copyable
     return result;
   }
 
+  /// Result of retrieveCommandFrame().
+  enum CommandFrameState
+  {
+    kCommandFrameComplete,    ///< a full, valid frame was extracted
+    kCommandFrameIncomplete,  ///< not enough bytes yet; buffer left untouched
+    kCommandFrameInvalid,     ///< a malformed frame; buffer left untouched
+  };
+
+  /// Wire format of a "command frame" (bespoke binary transport):
+  ///   [STX=0x02][cmd:1][wireLen:2 big-endian][escaped payload...][check:1]
+  ///
+  /// The payload is byte-stuffed so that the STX byte never occurs inside it:
+  /// a raw 0x02 or a raw escape byte (0x1B) is emitted on the wire as
+  ///   0x1B, (rawByte ^ 0x80)
+  /// so on the wire only 0x1B introduces an escape. `wireLen` counts the
+  /// ESCAPED (on-wire) payload bytes, so the whole frame is
+  /// kFrameHeaderLen + wireLen + kFrameTrailerLen bytes. The delivered payload
+  /// is the UN-escaped bytes, which may be shorter.
+  ///
+  /// `check` is a rolling checksum over the UN-escaped payload:
+  ///   c = 0x5a; for each unescaped byte b: c = rotl8(c, 1); c ^= b;
+  ///
+  /// Behavior:
+  ///   * kCommandFrameIncomplete (buffer and *out unchanged) until a whole
+  ///     frame has arrived;
+  ///   * kCommandFrameInvalid (buffer and *out unchanged) if the leading byte
+  ///     is not STX, wireLen exceeds kMaxFrameWireLen, an escape is dangling,
+  ///     or the checksum does not match;
+  ///   * on success sets *cmd and *out (the un-escaped payload), consumes
+  ///     exactly the frame's bytes, and returns kCommandFrameComplete.
+  static const uint8_t kFrameStx = 0x02;
+  static const uint8_t kFrameEsc = 0x1b;
+  static const size_t kFrameHeaderLen = 4;    // STX + cmd + wireLen(2)
+  static const size_t kFrameTrailerLen = 1;   // check
+  static const size_t kMaxFrameWireLen = 512;
+
+  CommandFrameState retrieveCommandFrame(uint8_t* cmd, string* out)
+  {
+    if (readableBytes() < kFrameHeaderLen + kFrameTrailerLen)
+    {
+      return kCommandFrameIncomplete;
+    }
+
+    const char* p = peek();
+    if (static_cast<uint8_t>(p[0]) != kFrameStx)
+    {
+      return kCommandFrameInvalid;
+    }
+
+    const uint16_t wireLen =
+        static_cast<uint16_t>(
+            (static_cast<uint16_t>(static_cast<uint8_t>(p[2])) << 8) |
+            static_cast<uint16_t>(static_cast<uint8_t>(p[3])));
+    const size_t frameLen = kFrameHeaderLen + wireLen + kFrameTrailerLen;
+
+    if (readableBytes() < frameLen)
+    {
+      return kCommandFrameIncomplete;
+    }
+
+    if (wireLen > kMaxFrameWireLen)
+    {
+      return kCommandFrameInvalid;
+    }
+
+    // Un-escape the on-wire payload into 'payload'.
+    string payload;
+    payload.reserve(wireLen);
+    const char* w = p + kFrameHeaderLen;
+    const char* wend = w + wireLen;
+    while (w < wend)
+    {
+      uint8_t b = static_cast<uint8_t>(*w++);
+      if (b == kFrameEsc)
+      {
+        if (w >= wend)
+        {
+          return kCommandFrameInvalid;  // dangling escape
+        }
+        b = static_cast<uint8_t>(static_cast<uint8_t>(*w++) ^ 0x40);
+      }
+      payload.push_back(static_cast<char>(b));
+    }
+
+    // Rolling checksum over the payload bytes.
+    uint8_t chk = 0x5a;
+    for (size_t i = 0; i < wireLen; ++i)
+    {
+      chk = static_cast<uint8_t>((chk << 1) | (chk >> 7));
+      chk ^= static_cast<uint8_t>(p[kFrameHeaderLen + i]);
+    }
+    if (chk != static_cast<uint8_t>(p[kFrameHeaderLen + wireLen]))
+    {
+      return kCommandFrameInvalid;
+    }
+
+    *cmd = static_cast<uint8_t>(p[1]);
+    out->assign(payload.data(), payload.size());
+    retrieve(kFrameHeaderLen + payload.size() + kFrameTrailerLen);
+    return kCommandFrameComplete;
+  }
+
   StringPiece toStringPiece() const
   {
     return StringPiece(peek(), static_cast<int>(readableBytes()));
