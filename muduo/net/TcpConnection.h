@@ -18,6 +18,8 @@
 #include "muduo/net/Buffer.h"
 #include "muduo/net/InetAddress.h"
 
+#include <atomic>
+#include <deque>
 #include <memory>
 
 #include <boost/any.hpp>
@@ -67,6 +69,17 @@ class TcpConnection : noncopyable,
   void send(const StringPiece& message);
   // void send(Buffer&& message); // C++11
   void send(Buffer* message);  // this one will swap data
+  // Output flush fence. Returns a nonzero FlushId identifying this fence.
+  // `callback` runs asynchronously in the loop thread, exactly once, when every
+  // byte submitted before this call has been written to the socket
+  // (kFlushComplete), when the connection closes first (kFlushAborted), or when
+  // the fence is cancelled (kFlushCancelled). Thread safe; any thread.
+  FlushId flush(const FlushCallback& callback);
+  // Cancel a still-pending flush fence by id. Returns true iff this call
+  // cancelled a pending fence (its callback then fires asynchronously with
+  // kFlushCancelled); false if the id is unknown or the fence already
+  // completed, aborted, or was cancelled. Thread safe; any thread.
+  bool cancelFlush(FlushId id);
   void shutdown(); // NOT thread safe, no simultaneous calling
   // void shutdownAndForceCloseAfter(double seconds); // NOT thread safe, no simultaneous calling
   void forceClose();
@@ -126,6 +139,10 @@ class TcpConnection : noncopyable,
   void shutdownInLoop();
   // void shutdownAndForceCloseInLoop(double seconds);
   void forceCloseInLoop();
+  void flushInLoop(FlushId id, const FlushCallback& callback);
+  bool cancelFlushInLoop(FlushId id);  // run on the loop; returns cancel result
+  void completeReadyFences();   // complete leading fences whose target is written
+  void abortAllFences();        // abort every still-pending fence, in order
   void setState(StateE s) { state_ = s; }
   const char* stateToString() const;
   void startReadInLoop();
@@ -148,6 +165,20 @@ class TcpConnection : noncopyable,
   size_t highWaterMark_;
   Buffer inputBuffer_;
   Buffer outputBuffer_; // FIXME: use list<Buffer> as output buffer.
+  // Output flush fences over the logical outbound byte stream. All fence state
+  // (positions, the pending deque) is owned by the loop thread; cross-thread
+  // flush()/cancelFlush() marshal into the loop. Only nextFlushId_ is atomic so
+  // flush() can mint an id without a round-trip.
+  struct Fence
+  {
+    FlushId id;              // nonzero identity, distinct even at equal target
+    int64_t target;          // submitted position this fence covers
+    FlushCallback callback;
+  };
+  std::atomic<uint64_t> nextFlushId_;  // monotonic id source (any thread)
+  int64_t bytesSubmitted_;   // total logical bytes accepted from send()
+  int64_t bytesWritten_;     // total logical bytes written to the socket
+  std::deque<Fence> fences_; // outstanding fences, in submission order
   boost::any context_;
   // FIXME: creationTime_, lastReceiveTime_
   //        bytesReceived_, bytesSent_

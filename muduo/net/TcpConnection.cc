@@ -15,6 +15,8 @@
 #include "muduo/net/Socket.h"
 #include "muduo/net/SocketsOps.h"
 
+#include <future>
+
 #include <errno.h>
 
 using namespace muduo;
@@ -48,7 +50,10 @@ TcpConnection::TcpConnection(EventLoop* loop,
     channel_(new Channel(loop, sockfd)),
     localAddr_(localAddr),
     peerAddr_(peerAddr),
-    highWaterMark_(64*1024*1024)
+    highWaterMark_(64*1024*1024),
+    nextFlushId_(0),
+    bytesSubmitted_(0),
+    bytesWritten_(0)
 {
   channel_->setReadCallback(
       std::bind(&TcpConnection::handleRead, this, _1));
@@ -147,6 +152,9 @@ void TcpConnection::sendInLoop(const void* data, size_t len)
     LOG_WARN << "disconnected, give up writing";
     return;
   }
+  // This whole logical send occupies one contiguous range of the outbound
+  // stream, regardless of which bytes are written directly vs. buffered.
+  bytesSubmitted_ += static_cast<int64_t>(len);
   // if no thing in output queue, try writing directly
   if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
   {
@@ -154,6 +162,8 @@ void TcpConnection::sendInLoop(const void* data, size_t len)
     if (nwrote >= 0)
     {
       remaining = len - nwrote;
+      // Bytes written directly to the socket advance the written position now.
+      bytesWritten_ += nwrote;
       if (remaining == 0 && writeCompleteCallback_)
       {
         loop_->queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));
@@ -189,6 +199,8 @@ void TcpConnection::sendInLoop(const void* data, size_t len)
       channel_->enableWriting();
     }
   }
+  // A direct write above may have already satisfied outstanding fences.
+  completeReadyFences();
 }
 
 void TcpConnection::shutdown()
@@ -339,6 +351,8 @@ void TcpConnection::connectDestroyed()
     setState(kDisconnected);
     channel_->disableAll();
 
+    // Tearing the connection down without a prior close still aborts fences.
+    abortAllFences();
     connectionCallback_(shared_from_this());
   }
   channel_->remove();
@@ -376,6 +390,10 @@ void TcpConnection::handleWrite()
     if (n > 0)
     {
       outputBuffer_.retrieve(n);
+      // Bytes drained from the output buffer advance the written position and
+      // may satisfy outstanding fences (completed in submission order).
+      bytesWritten_ += n;
+      completeReadyFences();
       if (outputBuffer_.readableBytes() == 0)
       {
         channel_->disableWriting();
@@ -414,6 +432,9 @@ void TcpConnection::handleClose()
   setState(kDisconnected);
   channel_->disableAll();
 
+  // No future write can reach any still-pending fence: abort them all, in order.
+  abortAllFences();
+
   TcpConnectionPtr guardThis(shared_from_this());
   connectionCallback_(guardThis);
   // must be the last line
@@ -427,3 +448,101 @@ void TcpConnection::handleError()
             << "] - SO_ERROR = " << err << " " << strerror_tl(err);
 }
 
+FlushId TcpConnection::flush(const FlushCallback& callback)
+{
+  // Mint a nonzero id without a loop round-trip. The fence itself is created and
+  // completed on the loop thread. Because the caller only learns `id` after this
+  // returns, any later cancelFlush(id) is necessarily marshalled AFTER the
+  // flushInLoop that materializes this fence -- so cancel never races ahead of
+  // creation.
+  FlushId id = ++nextFlushId_;
+  loop_->runInLoop(std::bind(&TcpConnection::flushInLoop, shared_from_this(), id, callback));
+  return id;
+}
+
+void TcpConnection::flushInLoop(FlushId id, const FlushCallback& callback)
+{
+  loop_->assertInLoopThread();
+  if (state_ == kDisconnected)
+  {
+    // Connection already gone: no future write can satisfy the fence.
+    loop_->queueInLoop(std::bind(callback, shared_from_this(), kFlushAborted));
+    return;
+  }
+  // Capture the current submitted position as this fence's target. Later sends
+  // advance bytesSubmitted_ further and are not covered by this fence.
+  Fence fence;
+  fence.id = id;
+  fence.target = bytesSubmitted_;
+  fence.callback = callback;
+  fences_.push_back(fence);
+  // An already-reached fence (target <= written) is completed here too, but
+  // completeReadyFences() only *queues* the callback, so it still runs async.
+  completeReadyFences();
+}
+
+bool TcpConnection::cancelFlush(FlushId id)
+{
+  // Fence state lives on the loop thread. From the loop thread (e.g. a reentrant
+  // cancel inside a callback) act directly; from another thread marshal the
+  // decision into the loop and block for the boolean result.
+  if (loop_->isInLoopThread())
+  {
+    return cancelFlushInLoop(id);
+  }
+  std::promise<bool> result;
+  std::future<bool> ready = result.get_future();
+  TcpConnectionPtr self(shared_from_this());
+  loop_->queueInLoop([this, self, id, &result]() {
+    result.set_value(cancelFlushInLoop(id));
+  });
+  return ready.get();
+}
+
+bool TcpConnection::cancelFlushInLoop(FlushId id)
+{
+  loop_->assertInLoopThread();
+  for (std::deque<Fence>::iterator it = fences_.begin(); it != fences_.end(); ++it)
+  {
+    if (it->id == id)
+    {
+      // Still pending: finalize (remove from the pending deque) before
+      // scheduling, so it can never also be completed or aborted.
+      FlushCallback cb = it->callback;
+      fences_.erase(it);
+      loop_->queueInLoop(std::bind(cb, shared_from_this(), kFlushCancelled));
+      return true;
+    }
+  }
+  // Unknown id, or the fence already left the pending deque via completion,
+  // abortion, or an earlier cancel -> nothing to cancel.
+  return false;
+}
+
+void TcpConnection::completeReadyFences()
+{
+  loop_->assertInLoopThread();
+  // Complete every leading fence whose target has been written, in submission
+  // order; stop at the first unreached fence (later targets cannot finish first
+  // in an ordered stream). Pop before queuing so a reentrant callback never
+  // observes or reactivates the fence currently being reported.
+  while (!fences_.empty() && fences_.front().target <= bytesWritten_)
+  {
+    FlushCallback cb = fences_.front().callback;
+    fences_.pop_front();
+    loop_->queueInLoop(std::bind(cb, shared_from_this(), kFlushComplete));
+  }
+}
+
+void TcpConnection::abortAllFences()
+{
+  loop_->assertInLoopThread();
+  // Finalize the pending container first, then queue aborts in submission
+  // order. Already-completed fences were popped earlier and keep their result.
+  std::deque<Fence> pending;
+  pending.swap(fences_);
+  for (const Fence& fence : pending)
+  {
+    loop_->queueInLoop(std::bind(fence.callback, shared_from_this(), kFlushAborted));
+  }
+}

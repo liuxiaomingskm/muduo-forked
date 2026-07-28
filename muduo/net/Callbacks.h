@@ -16,6 +16,8 @@
 #include <functional>
 #include <memory>
 
+#include <stdint.h>
+
 namespace muduo
 {
 
@@ -65,6 +67,19 @@ typedef std::function<void (const TcpConnectionPtr&)> ConnectionCallback;
 typedef std::function<void (const TcpConnectionPtr&)> CloseCallback;
 typedef std::function<void (const TcpConnectionPtr&)> WriteCompleteCallback;
 typedef std::function<void (const TcpConnectionPtr&, size_t)> HighWaterMarkCallback;
+
+// Identifier for an outstanding output flush fence (see TcpConnection::flush /
+// TcpConnection::cancelFlush). Always nonzero for a real fence.
+typedef uint64_t FlushId;
+
+// Result of an output flush fence (see TcpConnection::flush).
+enum FlushResult
+{
+  kFlushComplete,   // every byte ordered before the fence reached the socket
+  kFlushAborted,    // the connection closed before the fence was reached
+  kFlushCancelled,  // the fence was cancelled via cancelFlush() before completing
+};
+typedef std::function<void (const TcpConnectionPtr&, FlushResult)> FlushCallback;
 
 // the data has been read to (buf, len)
 typedef std::function<void (const TcpConnectionPtr&,
